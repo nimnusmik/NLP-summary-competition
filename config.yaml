@@ -7,16 +7,16 @@ inference:
   ckt_path: model ckt path
   early_stopping: true
   length_penalty: 1.0
-  max_new_tokens: 80
+  max_new_tokens: 60
   min_new_tokens: 12
   no_repeat_ngram_size: 3
-  num_beams: 4
+  num_beams: 7
   remove_tokens:
   - <usr>
   - <s>
   - </s>
   - <pad>
-  repetition_penalty: 1.2
+  repetition_penalty: 1.4
   result_path: ./prediction/
 tokenizer:
   bos_token: <s>

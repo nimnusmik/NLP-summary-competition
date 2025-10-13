@@ -5,7 +5,6 @@ import os
 import re
 import json
 import yaml
-from pathlib import Path
 from glob import glob
 from tqdm import tqdm
 from pprint import pprint
@@ -89,12 +88,12 @@ config_data = {
     "inference": {
         "ckt_path": "model ckt path", # 사전 학습이 진행된 모델의 checkpoint를 저장할 경로를 설정합니다.
         "result_path": "./prediction/",
-        "num_beams": 7,#4
+        "num_beams": 4,
         "length_penalty": 1.0,
         "no_repeat_ngram_size": 3,
-        "repetition_penalty": 1.4,#1.2
+        "repetition_penalty": 1.2,
         "min_new_tokens": 12,
-        "max_new_tokens": 60, #80
+        "max_new_tokens": 80,
         "early_stopping": True,
         "batch_size" : 32,
         # 정확한 모델 평가를 위해 제거할 불필요한 생성 토큰들을 정의합니다.
@@ -218,12 +217,11 @@ class Preprocess:
 
 # Train에 사용되는 Dataset 클래스를 정의합니다.
 class DatasetForTrain(Dataset):
-    def __init__(self, encoder_input, decoder_input, labels, len, pad_id):
+    def __init__(self, encoder_input, decoder_input, labels, len):
         self.encoder_input = encoder_input
         self.decoder_input = decoder_input
         self.labels = labels
         self.len = len
-        self.pad_id = pad_id
 
     def __getitem__(self, idx):
         item = {key: val[idx].clone().detach() for key, val in self.encoder_input.items()} # item[input_ids], item[attention_mask]
@@ -233,10 +231,7 @@ class DatasetForTrain(Dataset):
         item2.pop('input_ids')
         item2.pop('attention_mask')
         item.update(item2) #item[input_ids], item[attention_mask] item[decoder_input_ids], item[decoder_attention_mask]
-
-        labels = self.labels['input_ids'][idx].clone().detach()
-        labels[labels == self.pad_id] = -100           # ★ 핵심
-        item['labels'] = labels
+        item['labels'] = self.labels['input_ids'][idx] #item[input_ids], item[attention_mask] item[decoder_input_ids], item[decoder_attention_mask], item[labels]
         return item
 
     def __len__(self):
@@ -244,12 +239,11 @@ class DatasetForTrain(Dataset):
 
 # Validation에 사용되는 Dataset 클래스를 정의합니다.
 class DatasetForVal(Dataset):
-    def __init__(self, encoder_input, decoder_input, labels, len, pad_id):
+    def __init__(self, encoder_input, decoder_input, labels, len):
         self.encoder_input = encoder_input
         self.decoder_input = decoder_input
         self.labels = labels
         self.len = len
-        self.pad_id = pad_id
 
     def __getitem__(self, idx):
         item = {key: val[idx].clone().detach() for key, val in self.encoder_input.items()} # item[input_ids], item[attention_mask]
@@ -259,10 +253,7 @@ class DatasetForVal(Dataset):
         item2.pop('input_ids')
         item2.pop('attention_mask')
         item.update(item2) #item[input_ids], item[attention_mask] item[decoder_input_ids], item[decoder_attention_mask]
-
-        labels = self.labels['input_ids'][idx].clone().detach()
-        labels[labels == self.pad_id] = -100  
-        item['labels'] = labels
+        item['labels'] = self.labels['input_ids'][idx] #item[input_ids], item[attention_mask] item[decoder_input_ids], item[decoder_attention_mask], item[labels]
         return item
 
     def __len__(self):
@@ -289,11 +280,7 @@ class DatasetForInference(Dataset):
 
 # tokenization 과정까지 진행된 최종적으로 모델에 입력될 데이터를 출력합니다.
 def prepare_train_dataset(config, preprocessor, data_path, tokenizer):
-    data_root = Path(data_path)
-    if not data_root.exists():
-        raise FileNotFoundError(f"Data path not found: {data_root.resolve()}")
-
-    datasets = load_and_preprocess(data_root)
+    datasets = load_and_preprocess(data_path)
 
     # train, validation에 대해 각각 데이터프레임을 구축합니다.
     train_data = preprocessor.make_set_as_df(datasets['train'])
@@ -318,10 +305,7 @@ def prepare_train_dataset(config, preprocessor, data_path, tokenizer):
     tokenized_decoder_ouputs = tokenizer(decoder_output_train, return_tensors="pt", padding=True,
                         add_special_tokens=True, truncation=True, max_length=config['tokenizer']['decoder_max_len'], return_token_type_ids=False)
 
-    train_inputs_dataset = DatasetForTrain(
-        tokenized_encoder_inputs, tokenized_decoder_inputs, 
-        tokenized_decoder_ouputs,len(encoder_input_train),
-        pad_id=tokenizer.pad_token_id)
+    train_inputs_dataset = DatasetForTrain(tokenized_encoder_inputs, tokenized_decoder_inputs, tokenized_decoder_ouputs,len(encoder_input_train))
 
     val_tokenized_encoder_inputs = tokenizer(encoder_input_val, return_tensors="pt", padding=True,
                         add_special_tokens=True, truncation=True, max_length=config['tokenizer']['encoder_max_len'], return_token_type_ids=False)
@@ -330,10 +314,7 @@ def prepare_train_dataset(config, preprocessor, data_path, tokenizer):
     val_tokenized_decoder_ouputs = tokenizer(decoder_output_val, return_tensors="pt", padding=True,
                         add_special_tokens=True, truncation=True, max_length=config['tokenizer']['decoder_max_len'], return_token_type_ids=False)
 
-    val_inputs_dataset = DatasetForVal(
-        val_tokenized_encoder_inputs, val_tokenized_decoder_inputs,
-        val_tokenized_decoder_ouputs,len(encoder_input_val),
-        pad_id=tokenizer.pad_token_id)
+    val_inputs_dataset = DatasetForVal(val_tokenized_encoder_inputs, val_tokenized_decoder_inputs, val_tokenized_decoder_ouputs,len(encoder_input_val))
 
     print('-'*10, 'Make dataset complete', '-'*10,)
     return train_inputs_dataset, val_inputs_dataset
@@ -365,14 +346,15 @@ def compute_metrics(config,tokenizer,pred):
         replaced_predictions = [sentence.replace(token," ") for sentence in replaced_predictions]
         replaced_labels = [sentence.replace(token," ") for sentence in replaced_labels]
 
-    sample_count = min(3, len(replaced_predictions))
-    for idx in range(sample_count):
-        print('-'*150)
-        print(f"PRED: {replaced_predictions[idx]}")
-        print(f"GOLD: {replaced_labels[idx]}")
-    if sample_count == 0:
-        print('-'*150)
-        print('No evaluation samples available to preview.')
+    print('-'*150)
+    print(f"PRED: {replaced_predictions[0]}")
+    print(f"GOLD: {replaced_labels[0]}")
+    print('-'*150)
+    print(f"PRED: {replaced_predictions[1]}")
+    print(f"GOLD: {replaced_labels[1]}")
+    print('-'*150)
+    print(f"PRED: {replaced_predictions[2]}")
+    print(f"GOLD: {replaced_labels[2]}")
 
     # 최종적인 ROUGE 점수를 계산합니다.
     results = rouge.get_scores(replaced_predictions, replaced_labels,avg=True)
@@ -389,10 +371,6 @@ def compute_metrics(config,tokenizer,pred):
 def load_trainer_for_train(config,generate_model,tokenizer,train_inputs_dataset,val_inputs_dataset):
     print('-'*10, 'Make training arguments', '-'*10,)
     # set training args
-    report_to = config['training'].get('report_to') if isinstance(config.get('training'), dict) else None
-    if isinstance(report_to, str) and report_to.lower() in {'none', 'null', ''}:
-        report_to = None
-
     training_args = Seq2SeqTrainingArguments(
                 output_dir=config['general']['output_dir'], # model output directory
                 overwrite_output_dir=config['training']['overwrite_output_dir'],
@@ -417,28 +395,19 @@ def load_trainer_for_train(config,generate_model,tokenizer,train_inputs_dataset,
                 generation_max_length=config['training']['generation_max_length'],
                 do_train=config['training']['do_train'],
                 do_eval=config['training']['do_eval'],
-                report_to=report_to # (선택) wandb를 사용할 때 설정합니다.
+                report_to=config['training']['report_to'] # (선택) wandb를 사용할 때 설정합니다.
             )
 
     # (선택) 모델의 학습 과정을 추적하는 wandb를 사용하기 위해 초기화 해줍니다.
-    wandb_run = None
-    if report_to == 'wandb':
-        wandb_config = config.get('wandb', {})
-        try:
-            wandb_run = wandb.init(
-                entity=wandb_config.get('entity'),
-                project=wandb_config.get('project'),
-                name=wandb_config.get('name'),
-            )
-            # (선택) 모델 checkpoint를 wandb에 저장하도록 환경 변수를 설정합니다.
-            os.environ["WANDB_LOG_MODEL"] = "true"
-            os.environ["WANDB_WATCH"] = "false"
-        except Exception as exc:
-            print(f"[Warning] Failed to initialise Weights & Biases logging: {exc}")
-            wandb_run = None
-            training_args.report_to = []
-    elif report_to is None:
-        training_args.report_to = []
+    wandb.init(
+        entity=config['wandb']['entity'],
+        project=config['wandb']['project'],
+        name=config['wandb']['name'],
+    )
+
+    # (선택) 모델 checkpoint를 wandb에 저장하도록 환경 변수를 설정합니다.
+    os.environ["WANDB_LOG_MODEL"]="true"
+    os.environ["WANDB_WATCH"]="false"
 
     # Validation loss가 더 이상 개선되지 않을 때 학습을 중단시키는 EarlyStopping 기능을 사용합니다.
     MyCallback = EarlyStoppingCallback(
@@ -459,7 +428,7 @@ def load_trainer_for_train(config,generate_model,tokenizer,train_inputs_dataset,
     )
     print('-'*10, 'Make trainer complete', '-'*10,)
 
-    return trainer, wandb_run
+    return trainer
 
 
 # In[118]:
@@ -476,11 +445,6 @@ def load_tokenizer_and_model_for_train(config,device):
 
     special_tokens_dict={'additional_special_tokens':config['tokenizer']['special_tokens']}
     tokenizer.add_special_tokens(special_tokens_dict)
-
-
-    generate_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    generate_model.config.eos_token_id = tokenizer.eos_token_id
-    generate_model.config.pad_token_id = tokenizer.pad_token_id
 
     generate_model.resize_token_embeddings(len(tokenizer)) # 사전에 special token을 추가했으므로 재구성 해줍니다.
     generate_model.to(device)
@@ -513,12 +477,11 @@ def main(config):
     train_inputs_dataset, val_inputs_dataset = prepare_train_dataset(config,preprocessor, data_path, tokenizer)
 
     # Trainer 클래스를 불러옵니다.
-    trainer, wandb_run = load_trainer_for_train(config, generate_model,tokenizer,train_inputs_dataset,val_inputs_dataset)
+    trainer = load_trainer_for_train(config, generate_model,tokenizer,train_inputs_dataset,val_inputs_dataset)
     trainer.train()   # 모델 학습을 시작합니다.
 
     # (선택) 모델 학습이 완료된 후 wandb를 종료합니다.
-    if wandb_run is not None:
-        wandb.finish()
+    wandb.finish()
 
 
 # In[120]:
@@ -534,7 +497,7 @@ if __name__ == "__main__":
 
 
 # 이곳에 내가 사용할 wandb config 설정
-loaded_config['inference']['ckt_path'] = "/root/NLP/NLP/checkpoint-2000"
+loaded_config['inference']['ckt_path'] = "/root/NLP/NLP/checkpoint-2500"
 
 
 # - test data를 사용하여 모델의 성능을 확인합니다.
@@ -544,11 +507,7 @@ loaded_config['inference']['ckt_path'] = "/root/NLP/NLP/checkpoint-2000"
 
 # tokenization 과정까지 진행된 최종적으로 모델에 입력될 데이터를 출력합니다.
 def prepare_test_dataset(config,preprocessor, tokenizer):
-    data_root = Path(config['general']['data_path'])
-    if not data_root.exists():
-        raise FileNotFoundError(f"Data path not found: {data_root.resolve()}")
-
-    datasets = load_and_preprocess(data_root)
+    datasets = load_and_preprocess(config['general']['data_path'])
 
     test_data = preprocessor.make_set_as_df(datasets['test'], is_train=False)
     test_id = test_data['fname']
@@ -575,35 +534,22 @@ def prepare_test_dataset(config,preprocessor, tokenizer):
 
 
 # 추론을 위한 tokenizer와 학습시킨 모델을 불러옵니다.
-def load_tokenizer_and_model_for_test(config, device):
+def load_tokenizer_and_model_for_test(config,device):
     print('-'*10, 'Load tokenizer & model', '-'*10,)
 
     model_name = config['general']['model_name']
     ckt_path = config['inference']['ckt_path']
     print('-'*10, f'Model Name : {model_name}', '-'*10,)
-
-    # 0) 체크포인트 경로 확인(로컬 경로일 때)
-    if os.path.sep in ckt_path and not Path(ckt_path).exists():
-        raise FileNotFoundError(f"Checkpoint folder not found: {ckt_path}")
-
-    # 1) 토크나이저 + 스페셜 토큰
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     special_tokens_dict = {'additional_special_tokens': config['tokenizer']['special_tokens']}
     tokenizer.add_special_tokens(special_tokens_dict)
 
-    # 2) ✅ 모델 로드가 먼저!
     generate_model = BartForConditionalGeneration.from_pretrained(ckt_path)
     generate_model.resize_token_embeddings(len(tokenizer))
-
-    # 3) 그 다음에 config 세팅
-    generate_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    generate_model.config.eos_token_id = tokenizer.eos_token_id
-    generate_model.config.pad_token_id = tokenizer.pad_token_id
-
     generate_model.to(device)
     print('-'*10, 'Load tokenizer & model complete', '-'*10,)
 
-    return generate_model, tokenizer
+    return generate_model , tokenizer
 
 
 # In[ ]:
@@ -661,7 +607,6 @@ def inference(config):
     for token in remove_tokens:
         preprocessed_summary = [sentence.replace(token," ") for sentence in preprocessed_summary]
 
-    
     output = pd.DataFrame(
         {
             "fname": test_data['fname'],
