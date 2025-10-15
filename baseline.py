@@ -1,4 +1,5 @@
- 
+from __future__ import annotations
+
 # In[56]:
 import pandas as pd
 import os
@@ -14,15 +15,34 @@ import pytorch_lightning as pl
 from rouge import Rouge # 모델의 성능을 평가하기 위한 라이브러리입니다.
 
 from torch.utils.data import Dataset , DataLoader
-from transformers import AutoTokenizer, BartForConditionalGeneration, BartConfig
+from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 from transformers import Trainer, TrainingArguments
 from transformers import EarlyStoppingCallback
 
 from preprocess import load_and_preprocess
 from generation import build_generation_kwargs
-
 import wandb # 모델 학습 과정을 손쉽게 Tracking하고, 시각화할 수 있는 라이브러리입니다.
+
+
+def _configure_seq2seq_special_tokens(model, tokenizer) -> None:
+    decoder_start = getattr(model.config, "decoder_start_token_id", None)
+    if decoder_start is None and tokenizer.bos_token_id is not None:
+        decoder_start = tokenizer.bos_token_id
+    if decoder_start is None and tokenizer.cls_token_id is not None:
+        decoder_start = tokenizer.cls_token_id
+    if decoder_start is None and tokenizer.pad_token_id is not None:
+        decoder_start = tokenizer.pad_token_id
+    if decoder_start is not None:
+        model.config.decoder_start_token_id = decoder_start
+
+    if tokenizer.eos_token_id is not None:
+        model.config.eos_token_id = tokenizer.eos_token_id
+    elif getattr(model.config, "eos_token_id", None) is None and tokenizer.sep_token_id is not None:
+        model.config.eos_token_id = tokenizer.sep_token_id
+
+    if tokenizer.pad_token_id is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
 
 
 # ### 2) Config file 만들기 (선택)
@@ -33,7 +53,8 @@ import wandb # 모델 학습 과정을 손쉽게 Tracking하고, 시각화할 �
 
 
 # config 설정에 tokenizer 모듈이 사용되므로 미리 tokenizer를 정의해줍니다.
-tokenizer = AutoTokenizer.from_pretrained("digit82/kobart-summarization")
+DEFAULT_MODEL_NAME = "paust/pko-chat-t5-large"
+tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME)
 
 
 # In[101]:
@@ -42,14 +63,15 @@ tokenizer = AutoTokenizer.from_pretrained("digit82/kobart-summarization")
 config_data = {
     "general": {
         "data_path": "./data/", # 모델 생성에 필요한 데이터 경로를 사용자 환경에 맞게 지정합니다.
-        "model_name": "digit82/kobart-summarization", # 불러올 모델의 이름을 사용자 환경에 맞게 지정할 수 있습니다.
+        "model_name": DEFAULT_MODEL_NAME, # 불러올 모델의 이름을 사용자 환경에 맞게 지정할 수 있습니다.
         "output_dir": "./" # 모델의 최종 출력 값을 저장할 경로를 설정합니다.
     },
     "tokenizer": {
         "encoder_max_len": 512,
         "decoder_max_len": 100,
-        "bos_token": f"{tokenizer.bos_token}",
-        "eos_token": f"{tokenizer.eos_token}",
+        "bos_token": tokenizer.bos_token,
+        "eos_token": tokenizer.eos_token,
+        "encoder_prefix": "summarize: ",
         # 특정 단어들이 분해되어 tokenization이 수행되지 않도록 special_tokens을 지정해줍니다.
         "special_tokens": ['#Person1#', '#Person2#', '#Person3#', '#PhoneNumber#', '#Address#', '#PassportNumber#']
     },
@@ -57,13 +79,14 @@ config_data = {
         "overwrite_output_dir": True,
         "num_train_epochs": 20,
         "learning_rate": 1e-5,
-        "per_device_train_batch_size": 50,
-        "per_device_eval_batch_size": 32,
+        "per_device_train_batch_size": 2,
+        "per_device_eval_batch_size": 2,
         "warmup_ratio": 0.1,
         "weight_decay": 0.01,
         "lr_scheduler_type": 'cosine',
         "optim": 'adamw_torch',
         "gradient_accumulation_steps": 1,
+        "gradient_checkpointing": True,
         "evaluation_strategy": 'epoch',
         "save_strategy": 'epoch',
         "save_total_limit": 5,
@@ -98,7 +121,7 @@ config_data = {
         "early_stopping": True,
         "batch_size" : 32,
         # 정확한 모델 평가를 위해 제거할 불필요한 생성 토큰들을 정의합니다.
-        "remove_tokens": ['<usr>', f"{tokenizer.bos_token}", f"{tokenizer.eos_token}", f"{tokenizer.pad_token}"]
+        "remove_tokens": ['<usr>'] + [tok for tok in (tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token) if tok]
     }
 }
 
@@ -186,12 +209,15 @@ loaded_config['inference']
 # 데이터 전처리를 위한 클래스로, 데이터셋을 데이터프레임으로 변환하고 인코더와 디코더의 입력을 생성합니다.
 class Preprocess:
     def __init__(self,
-            bos_token: str,
-            eos_token: str,
+            bos_token: str | None,
+            eos_token: str | None,
+            encoder_prefix: str = "",
+            decoder_start: str | None = None,
         ) -> None:
 
-        self.bos_token = bos_token
-        self.eos_token = eos_token
+        self.encoder_prefix = encoder_prefix or ""
+        self.decoder_start = decoder_start if decoder_start is not None else (bos_token or "")
+        self.decoder_end = eos_token or ""
 
     @staticmethod
     # 실험에 필요한 컬럼을 가져옵니다.
@@ -200,17 +226,16 @@ class Preprocess:
             return dataset[['fname', 'dialogue', 'summary']].copy()
         return dataset[['fname', 'dialogue']].copy()
 
-    # BART 모델의 입력, 출력 형태를 맞추기 위해 전처리를 진행합니다.
-    def make_input(self, dataset,is_test = False):
+    # 모델 유형에 관계없이 사용할 수 있는 입력/출력 전처리를 구성합니다.
+    def make_input(self, dataset, is_test: bool = False):
+        encoder_series = dataset['dialogue'].apply(lambda x: f"{self.encoder_prefix}{x}" if self.encoder_prefix else str(x))
         if is_test:
-            encoder_input = dataset['dialogue']
-            decoder_input = [self.bos_token] * len(dataset['dialogue'])
-            return encoder_input.tolist(), list(decoder_input)
-        else:
-            encoder_input = dataset['dialogue']
-            decoder_input = dataset['summary'].apply(lambda x : self.bos_token + str(x)) # Ground truth를 디코더의 input으로 사용하여 학습합니다.
-            decoder_output = dataset['summary'].apply(lambda x : str(x) + self.eos_token)
-            return encoder_input.tolist(), decoder_input.tolist(), decoder_output.tolist()
+            decoder_input = [self.decoder_start] * len(dataset['dialogue'])
+            return encoder_series.tolist(), list(decoder_input)
+
+        decoder_input = dataset['summary'].apply(lambda x: f"{self.decoder_start}{x}")
+        decoder_output = dataset['summary'].apply(lambda x: f"{x}{self.decoder_end}")
+        return encoder_series.tolist(), decoder_input.tolist(), decoder_output.tolist()
 
 
 # In[113]:
@@ -417,6 +442,7 @@ def load_trainer_for_train(config,generate_model,tokenizer,train_inputs_dataset,
                 generation_max_length=config['training']['generation_max_length'],
                 do_train=config['training']['do_train'],
                 do_eval=config['training']['do_eval'],
+                gradient_checkpointing=config['training'].get('gradient_checkpointing', False),
                 report_to=report_to # (선택) wandb를 사용할 때 설정합니다.
             )
 
@@ -470,19 +496,25 @@ def load_tokenizer_and_model_for_train(config,device):
     print('-'*10, 'Load tokenizer & model', '-'*10,)
     print('-'*10, f'Model Name : {config["general"]["model_name"]}', '-'*10,)
     model_name = config['general']['model_name']
-    bart_config = BartConfig().from_pretrained(model_name)
+    model_config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    generate_model = BartForConditionalGeneration.from_pretrained(config['general']['model_name'],config=bart_config)
 
-    special_tokens_dict={'additional_special_tokens':config['tokenizer']['special_tokens']}
-    tokenizer.add_special_tokens(special_tokens_dict)
+    special_tokens = config.get('tokenizer', {}).get('special_tokens')
+    if special_tokens:
+        tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
 
+    generate_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, config=model_config)
 
-    generate_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    generate_model.config.eos_token_id = tokenizer.eos_token_id
-    generate_model.config.pad_token_id = tokenizer.pad_token_id
+    if special_tokens:
+        generate_model.resize_token_embeddings(len(tokenizer))
 
-    generate_model.resize_token_embeddings(len(tokenizer)) # 사전에 special token을 추가했으므로 재구성 해줍니다.
+    _configure_seq2seq_special_tokens(generate_model, tokenizer)
+
+    if config.get('training', {}).get('gradient_checkpointing'):
+        if hasattr(generate_model, 'gradient_checkpointing_enable'):
+            generate_model.gradient_checkpointing_enable()
+        generate_model.config.use_cache = False
+
     generate_model.to(device)
     print(generate_model.config)
 
@@ -508,7 +540,13 @@ def main(config):
     print('-'*10,"tokenizer special tokens : ",tokenizer.special_tokens_map,'-'*10)
 
     # 학습에 사용할 데이터셋을 불러옵니다.
-    preprocessor = Preprocess(config['tokenizer']['bos_token'], config['tokenizer']['eos_token']) # decoder_start_token: str, eos_token: str
+    tokenizer_cfg = config.get('tokenizer', {})
+    preprocessor = Preprocess(
+        tokenizer_cfg.get('bos_token'),
+        tokenizer_cfg.get('eos_token'),
+        encoder_prefix=tokenizer_cfg.get('encoder_prefix', ''),
+        decoder_start=tokenizer_cfg.get('decoder_start_token'),
+    )
     data_path = config['general']['data_path']
     train_inputs_dataset, val_inputs_dataset = prepare_train_dataset(config,preprocessor, data_path, tokenizer)
 
@@ -588,17 +626,19 @@ def load_tokenizer_and_model_for_test(config, device):
 
     # 1) 토크나이저 + 스페셜 토큰
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    special_tokens_dict = {'additional_special_tokens': config['tokenizer']['special_tokens']}
-    tokenizer.add_special_tokens(special_tokens_dict)
+    special_tokens = config.get('tokenizer', {}).get('special_tokens')
+    if special_tokens:
+        tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
 
     # 2) ✅ 모델 로드가 먼저!
-    generate_model = BartForConditionalGeneration.from_pretrained(ckt_path)
-    generate_model.resize_token_embeddings(len(tokenizer))
+    generate_model = AutoModelForSeq2SeqLM.from_pretrained(ckt_path)
+
+    if special_tokens:
+        generate_model.resize_token_embeddings(len(tokenizer))
 
     # 3) 그 다음에 config 세팅
-    generate_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    generate_model.config.eos_token_id = tokenizer.eos_token_id
-    generate_model.config.pad_token_id = tokenizer.pad_token_id
+    _configure_seq2seq_special_tokens(generate_model, tokenizer)
+    generate_model.config.use_cache = True
 
     generate_model.to(device)
     print('-'*10, 'Load tokenizer & model complete', '-'*10,)
@@ -617,7 +657,13 @@ def inference(config):
 
     generate_model , tokenizer = load_tokenizer_and_model_for_test(config,device)
 
-    preprocessor = Preprocess(config['tokenizer']['bos_token'], config['tokenizer']['eos_token'])
+    tokenizer_cfg = config.get('tokenizer', {})
+    preprocessor = Preprocess(
+        tokenizer_cfg.get('bos_token'),
+        tokenizer_cfg.get('eos_token'),
+        encoder_prefix=tokenizer_cfg.get('encoder_prefix', ''),
+        decoder_start=tokenizer_cfg.get('decoder_start_token'),
+    )
 
     test_data, test_encoder_inputs_dataset = prepare_test_dataset(config,preprocessor, tokenizer)
     dataloader = DataLoader(test_encoder_inputs_dataset, batch_size=config['inference']['batch_size'])
@@ -656,10 +702,10 @@ def inference(config):
                 summary.append(result)
 
     # 정확한 평가를 위하여 노이즈에 해당되는 스페셜 토큰을 제거합니다.
-    remove_tokens = config['inference']['remove_tokens']
+    remove_tokens = [tok for tok in config['inference'].get('remove_tokens', []) if tok]
     preprocessed_summary = summary.copy()
     for token in remove_tokens:
-        preprocessed_summary = [sentence.replace(token," ") for sentence in preprocessed_summary]
+        preprocessed_summary = [sentence.replace(token, " ") for sentence in preprocessed_summary]
 
     
     output = pd.DataFrame(

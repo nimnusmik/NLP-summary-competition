@@ -19,6 +19,16 @@ def build_generation_kwargs(
     Returns:
         Dictionary ready to pass to ``model.generate``.
     """
+    decoder_start_token_id = tokenizer.bos_token_id
+    if decoder_start_token_id is None and tokenizer.cls_token_id is not None:
+        decoder_start_token_id = tokenizer.cls_token_id
+    if decoder_start_token_id is None and tokenizer.pad_token_id is not None:
+        decoder_start_token_id = tokenizer.pad_token_id
+
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None and tokenizer.sep_token_id is not None:
+        eos_token_id = tokenizer.sep_token_id
+
     gen_kwargs: Dict[str, Any] = {
         #4가지 문장 경로를 동시에 탐색해요
         "num_beams": 4, #4
@@ -30,8 +40,8 @@ def build_generation_kwargs(
         "min_new_tokens": 12,#최소 12개 단어(토큰) 를 생성하기 전에는 절대 문장을 끝내지 못하게 해요.
         "max_new_tokens": 80, #모델이 한 번에 만들 수 있는 최대 단어(토큰)로 80개가 넘어가면 강제로 멈춰서 끝없는 문장 루프 방지.
         "early_stopping": True,
-        "decoder_start_token_id": tokenizer.bos_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
+        "decoder_start_token_id": decoder_start_token_id,
+        "eos_token_id": eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
     }
 
