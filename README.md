@@ -4,8 +4,6 @@
 
 본 프로젝트는 **Upstage AI Lab 대화 요약(Dialogue Summarization)** 대회에서 **3위**를 달성한 Team 1SEN의 솔루션입니다.
 
-**[1SEN]** = IS+EN → 1SEN → **일쎈** → **"우리가 제일 쎈"**
-
 - **대회 기간**: 2024.09.26 ~ 2024.10.15
 - **최종 점수**: **45.1791** (3rd Place - Mid/Final)
 - **평가 지표**: ROUGE-1, ROUGE-2, ROUGE-L의 평균
